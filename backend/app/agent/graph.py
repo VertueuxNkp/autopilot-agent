@@ -4,7 +4,7 @@ import uuid
 from typing import TypedDict
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
 from langgraph.graph import StateGraph, END
 from app.tools.definitions import TOOLS
 
@@ -20,6 +20,7 @@ class AgentState(TypedDict):
     step_count: int
     status: str
     checkpoint_data: dict
+    clarification_question: str  # nouveau
 
 
 # ─── NŒUDS DU GRAPH ────────────────────────────────────────────────────────────
@@ -48,7 +49,7 @@ def make_agent_node(llm_with_tools):
         else:
             decision_log = {
                 "step": step,
-                "message": "Réponse directe générée sans outil",
+                "message": f"Réponse finale : {response.content[:100]}...",
                 "timestamp": int(time.time() * 1000),
                 "type": "info"
             }
@@ -124,9 +125,16 @@ def should_continue(state: AgentState) -> str:
 
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         tool_names = [tc["name"] for tc in last_message.tool_calls]
+
+        # Actions irréversibles → checkpoint
         irreversible = ["send_email", "schedule_meeting"]
         if any(name in irreversible for name in tool_names):
             return "checkpoint"
+
+        # Clarification demandée → pause
+        if "clarify_input" in tool_names:
+            return "clarification"
+
         return "tools"
 
     return "end"
@@ -157,6 +165,41 @@ def checkpoint_node(state: AgentState) -> AgentState:
     }
 
 
+def clarification_node(state: AgentState) -> AgentState:
+    """
+    Nouveau nœud — détecte la question posée par clarify_input
+    et met le workflow en pause en attendant la réponse
+    """
+    last_message = state["messages"][-1]
+    step = state["step_count"] + 1
+
+    # Récupérer la question générée par clarify_input
+    clarification_question = "Pouvez-vous préciser votre demande ?"
+    for tool_call in last_message.tool_calls:
+        if tool_call["name"] == "clarify_input":
+            ambiguous = tool_call["args"].get("ambiguous_request", "")
+            options = tool_call["args"].get("options", [])
+            if options:
+                clarification_question = f"{ambiguous} — Options : {', '.join(options)}"
+            else:
+                clarification_question = ambiguous
+
+    log = {
+        "step": step,
+        "message": f"Question posée à l'utilisateur : {clarification_question}",
+        "timestamp": int(time.time() * 1000),
+        "type": "warning"
+    }
+
+    return {
+        **state,
+        "status": "clarification_required",
+        "clarification_question": clarification_question,
+        "reasoning_logs": state["reasoning_logs"] + [log],
+        "step_count": step
+    }
+
+
 # ─── CONSTRUCTION DU GRAPH ─────────────────────────────────────────────────────
 
 def build_graph(llm_with_tools):
@@ -165,6 +208,7 @@ def build_graph(llm_with_tools):
     graph.add_node("agent", make_agent_node(llm_with_tools))
     graph.add_node("tools", tools_node)
     graph.add_node("checkpoint", checkpoint_node)
+    graph.add_node("clarification", clarification_node)  # nouveau
 
     graph.set_entry_point("agent")
 
@@ -174,20 +218,22 @@ def build_graph(llm_with_tools):
         {
             "tools": "tools",
             "checkpoint": "checkpoint",
+            "clarification": "clarification",  # nouveau
             "end": END
         }
     )
 
     graph.add_edge("tools", "agent")
     graph.add_edge("checkpoint", END)
+    graph.add_edge("clarification", END)  # nouveau
 
     return graph.compile()
 
 
-# ─── FONCTION PRINCIPALE ───────────────────────────────────────────────────────
+# ─── FONCTIONS PRINCIPALES ─────────────────────────────────────────────────────
 
 async def run_workflow(user_id: str, request: str) -> dict:
-    # Initialisation du LLM ici — après que load_dotenv() ait été appelé
+    """Lance un nouveau workflow"""
     llm = ChatOpenAI(
         model=os.getenv("QWEN_MODEL", "qwen-plus"),
         api_key=os.getenv("QWEN_API_KEY"),
@@ -204,9 +250,9 @@ Ton rôle : analyser les demandes des utilisateurs et les exécuter étape par �
 
 RÈGLES IMPORTANTES :
 1. Toujours appeler check_for_ambiguity en premier pour analyser la demande
-2. Si des informations manquent, appeler clarify_input pour poser une question
+2. Si des informations manquent, appeler clarify_input pour poser UNE seule question
 3. Exécuter les tools nécessaires dans le bon ordre
-4. Être précis et professionnel dans tes réponses
+4. Être précis et professionnel
 
 Demande de l'utilisateur : {request}
 """)
@@ -218,7 +264,8 @@ Demande de l'utilisateur : {request}
         "reasoning_logs": [],
         "step_count": 0,
         "status": "pending",
-        "checkpoint_data": {}
+        "checkpoint_data": {},
+        "clarification_question": ""
     }
 
     graph = build_graph(llm_with_tools)
@@ -229,5 +276,49 @@ Demande de l'utilisateur : {request}
         "status": final_state["status"],
         "reasoning_logs": final_state["reasoning_logs"],
         "checkpoint_data": final_state.get("checkpoint_data", {}),
-        "messages": final_state["messages"]
+        "clarification_question": final_state.get("clarification_question", ""),
+        "messages": final_state["messages"],
+        "step_count": final_state["step_count"],      # nouveau
+        "user_id": final_state["user_id"],            # nouveau
+        "workflow_id": final_state["workflow_id"],    # nouveau
+    }
+
+
+async def resume_workflow(workflow_id: str, answer: str, stored_state: dict) -> dict:
+    """
+    Reprend un workflow après que l'utilisateur a répondu à une clarification
+    """
+    llm = ChatOpenAI(
+        model=os.getenv("QWEN_MODEL", "qwen-plus"),
+        api_key=os.getenv("QWEN_API_KEY"),
+        base_url=os.getenv("QWEN_BASE_URL"),
+        temperature=0.1
+    )
+    llm_with_tools = llm.bind_tools(TOOLS)
+
+    # Ajouter la réponse de l'utilisateur à l'historique des messages
+    messages = stored_state["messages"]
+    messages.append(HumanMessage(content=f"Réponse à la clarification : {answer}"))
+
+    # Reprendre depuis l'état sauvegardé
+    resumed_state: AgentState = {
+        **stored_state,
+        "messages": messages,
+        "status": "running",
+        "clarification_question": ""
+    }
+
+    graph = build_graph(llm_with_tools)
+    final_state = graph.invoke(resumed_state)
+
+    return {
+        "workflow_id": workflow_id,
+        "status": final_state["status"],
+        "reasoning_logs": final_state["reasoning_logs"],
+        "checkpoint_data": final_state.get("checkpoint_data", {}),
+        "clarification_question": final_state.get("clarification_question", ""),
+        "messages": final_state["messages"],
+        "step_count": final_state["step_count"],      # nouveau
+        "user_id": final_state["user_id"],            # nouveau
+        "workflow_id": final_state["workflow_id"],    # nouveau
     }
