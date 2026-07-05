@@ -2,6 +2,7 @@ import os
 import re
 import time
 import uuid
+import asyncio
 from typing import TypedDict
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -42,14 +43,35 @@ FALLBACKS = {
     }
 }
 
-# Tools sans check_for_ambiguity
 TOOLS_WITHOUT_CHECK = [t for t in TOOLS if t.name != "check_for_ambiguity"]
+
+
+# ─── FONCTION D'ENVOI WEBSOCKET ────────────────────────────────────────────────
+async def send_log_via_ws(workflow_id: str, log: dict):
+    """Envoie un log via WebSocket si une connexion est active"""
+    try:
+        from app.api.websocket import manager
+        await manager.send_log(workflow_id, {
+            "type": "reasoning_log",
+            **log
+        })
+    except Exception:
+        pass
+
+
+def send_log_sync(workflow_id: str, log: dict):
+    """Version synchrone pour les nœuds LangGraph"""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(send_log_via_ws(workflow_id, log))
+    except Exception:
+        pass
 
 
 # ─── FONCTIONS UTILITAIRES ─────────────────────────────────────────────────────
 
 def detect_action(request: str) -> str:
-    """Détecte l'action à exécuter selon la demande"""
     request_lower = request.lower()
     if any(w in request_lower for w in ["email", "mail", "envoie", "envoyer"]):
         return "send_email"
@@ -61,7 +83,6 @@ def detect_action(request: str) -> str:
 
 
 def extract_email_args(request: str) -> dict:
-    """Extrait les arguments pour send_email depuis la demande"""
     email_match = re.search(r'[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}', request)
     recipient = email_match.group(0) if email_match else ""
     return {
@@ -72,7 +93,6 @@ def extract_email_args(request: str) -> dict:
 
 
 def extract_meeting_args(request: str) -> dict:
-    """Extrait les arguments pour schedule_meeting depuis la demande"""
     return {
         "attendee": "Participant",
         "date": "demain",
@@ -82,7 +102,6 @@ def extract_meeting_args(request: str) -> dict:
 
 
 def extract_quote_args(request: str) -> dict:
-    """Extrait les arguments pour generate_quote depuis la demande"""
     prices = re.findall(r'\d+(?:[.,]\d+)?', request)
     price = float(prices[0].replace(',', '.')) if prices else 100.0
     return {
@@ -98,6 +117,7 @@ def extract_quote_args(request: str) -> dict:
 def make_agent_node(llm_with_tools, llm_with_tools_no_check):
     def agent_node(state: AgentState) -> AgentState:
         step = state["step_count"] + 1
+        workflow_id = state["workflow_id"]
 
         log = {
             "step": step,
@@ -105,6 +125,7 @@ def make_agent_node(llm_with_tools, llm_with_tools_no_check):
             "timestamp": int(time.time() * 1000),
             "type": "info"
         }
+        send_log_sync(workflow_id, log)
 
         if state.get("ambiguity_checked"):
             response = llm_with_tools_no_check.invoke(state["messages"])
@@ -127,6 +148,8 @@ def make_agent_node(llm_with_tools, llm_with_tools_no_check):
                 "type": "info"
             }
 
+        send_log_sync(workflow_id, decision_log)
+
         return {
             **state,
             "messages": state["messages"] + [response],
@@ -140,6 +163,7 @@ def make_agent_node(llm_with_tools, llm_with_tools_no_check):
 def tools_node(state: AgentState) -> AgentState:
     last_message = state["messages"][-1]
     step = state["step_count"] + 1
+    workflow_id = state["workflow_id"]
     new_logs = []
     new_messages = []
     fallback_triggered = None
@@ -149,12 +173,14 @@ def tools_node(state: AgentState) -> AgentState:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
 
-        new_logs.append({
+        log = {
             "step": step,
             "message": f"Exécution de '{tool_name}'...",
             "timestamp": int(time.time() * 1000),
             "type": "info"
-        })
+        }
+        new_logs.append(log)
+        send_log_sync(workflow_id, log)
 
         tool_func = next((t for t in TOOLS if t.name == tool_name), None)
 
@@ -162,22 +188,21 @@ def tools_node(state: AgentState) -> AgentState:
             try:
                 result = tool_func.invoke(tool_args)
 
-                new_logs.append({
+                success_log = {
                     "step": step,
                     "message": f"'{tool_name}' terminé avec succès",
                     "timestamp": int(time.time() * 1000),
                     "type": "info"
-                })
+                }
+                new_logs.append(success_log)
+                send_log_sync(workflow_id, success_log)
 
-                # Si check_for_ambiguity retourne is_ambiguous=False
-                # → exécuter directement l'action dans le code
                 if tool_name == "check_for_ambiguity":
                     ambiguity_checked = True
                     result_dict = result if isinstance(result, dict) else {}
                     is_ambiguous = result_dict.get("is_ambiguous", True)
 
                     if not is_ambiguous:
-                        # Récupérer la demande originale
                         original_request = ""
                         for msg in state["messages"]:
                             if hasattr(msg, "content") and isinstance(msg.content, str):
@@ -185,14 +210,15 @@ def tools_node(state: AgentState) -> AgentState:
                                 break
 
                         action = detect_action(original_request)
-                        new_logs.append({
+                        action_log = {
                             "step": step,
                             "message": f"Demande claire — exécution directe : {action}",
                             "timestamp": int(time.time() * 1000),
                             "type": "info"
-                        })
+                        }
+                        new_logs.append(action_log)
+                        send_log_sync(workflow_id, action_log)
 
-                        # Choisir les args selon l'action
                         if action == "send_email":
                             args = extract_email_args(original_request)
                             action_tool = next(t for t in TOOLS if t.name == "send_email")
@@ -209,18 +235,31 @@ def tools_node(state: AgentState) -> AgentState:
                         if action_tool:
                             try:
                                 action_result = action_tool.invoke(args)
-                                new_logs.append({
+                                exec_log = {
                                     "step": step + 1,
                                     "message": f"'{action}' exécuté avec succès",
                                     "timestamp": int(time.time() * 1000),
                                     "type": "info"
-                                })
+                                }
+                                new_logs.append(exec_log)
+                                send_log_sync(workflow_id, exec_log)
+
                                 new_messages.append(
                                     ToolMessage(
                                         content=str(result),
                                         tool_call_id=tool_call["id"]
                                     )
                                 )
+
+                                checkpoint_log = {
+                                    "step": step + 1,
+                                    "message": "Confirmation requise avant d'exécuter l'action",
+                                    "timestamp": int(time.time() * 1000),
+                                    "type": "warning"
+                                }
+                                new_logs.append(checkpoint_log)
+                                send_log_sync(workflow_id, checkpoint_log)
+
                                 return {
                                     **state,
                                     "messages": state["messages"] + new_messages,
@@ -238,12 +277,15 @@ def tools_node(state: AgentState) -> AgentState:
 
                             except ValueError as e:
                                 error_msg = str(e)
-                                new_logs.append({
+                                error_log = {
                                     "step": step + 1,
                                     "message": f"Erreur dans '{action}' : {error_msg}",
                                     "timestamp": int(time.time() * 1000),
                                     "type": "error"
-                                })
+                                }
+                                new_logs.append(error_log)
+                                send_log_sync(workflow_id, error_log)
+
                                 if action in FALLBACKS:
                                     fallback = FALLBACKS[action]
                                     fallback_triggered = {
@@ -252,12 +294,14 @@ def tools_node(state: AgentState) -> AgentState:
                                         "question": fallback["question"],
                                         "options": fallback["options"]
                                     }
-                                    new_logs.append({
+                                    fallback_log = {
                                         "step": step + 1,
                                         "message": f"Fallback déclenché : {fallback['question']}",
                                         "timestamp": int(time.time() * 1000),
                                         "type": "warning"
-                                    })
+                                    }
+                                    new_logs.append(fallback_log)
+                                    send_log_sync(workflow_id, fallback_log)
 
                 new_messages.append(
                     ToolMessage(
@@ -268,12 +312,15 @@ def tools_node(state: AgentState) -> AgentState:
 
             except ValueError as e:
                 error_msg = str(e)
-                new_logs.append({
+                error_log = {
                     "step": step,
                     "message": f"Erreur dans '{tool_name}' : {error_msg}",
                     "timestamp": int(time.time() * 1000),
                     "type": "error"
-                })
+                }
+                new_logs.append(error_log)
+                send_log_sync(workflow_id, error_log)
+
                 if tool_name in FALLBACKS:
                     fallback = FALLBACKS[tool_name]
                     fallback_triggered = {
@@ -282,12 +329,15 @@ def tools_node(state: AgentState) -> AgentState:
                         "question": fallback["question"],
                         "options": fallback["options"]
                     }
-                    new_logs.append({
+                    fallback_log = {
                         "step": step,
                         "message": f"Fallback déclenché : {fallback['question']}",
                         "timestamp": int(time.time() * 1000),
                         "type": "warning"
-                    })
+                    }
+                    new_logs.append(fallback_log)
+                    send_log_sync(workflow_id, fallback_log)
+
                 new_messages.append(
                     ToolMessage(
                         content=f"Erreur : {error_msg}",
@@ -297,12 +347,15 @@ def tools_node(state: AgentState) -> AgentState:
 
             except Exception as e:
                 error_msg = str(e)
-                new_logs.append({
+                error_log = {
                     "step": step,
                     "message": f"Erreur inattendue dans '{tool_name}' : {error_msg}",
                     "timestamp": int(time.time() * 1000),
                     "type": "error"
-                })
+                }
+                new_logs.append(error_log)
+                send_log_sync(workflow_id, error_log)
+
                 new_messages.append(
                     ToolMessage(
                         content=f"Erreur inattendue : {error_msg}",
@@ -353,6 +406,7 @@ def should_continue(state: AgentState) -> str:
 def checkpoint_node(state: AgentState) -> AgentState:
     last_message = state["messages"][-1]
     step = state["step_count"] + 1
+    workflow_id = state["workflow_id"]
 
     checkpoint_data = {
         "pending_tools": last_message.tool_calls,
@@ -365,6 +419,7 @@ def checkpoint_node(state: AgentState) -> AgentState:
         "timestamp": int(time.time() * 1000),
         "type": "warning"
     }
+    send_log_sync(workflow_id, log)
 
     return {
         **state,
@@ -378,6 +433,7 @@ def checkpoint_node(state: AgentState) -> AgentState:
 def clarification_node(state: AgentState) -> AgentState:
     last_message = state["messages"][-1]
     step = state["step_count"] + 1
+    workflow_id = state["workflow_id"]
 
     clarification_question = "Pouvez-vous préciser votre demande ?"
     for tool_call in last_message.tool_calls:
@@ -395,6 +451,7 @@ def clarification_node(state: AgentState) -> AgentState:
         "timestamp": int(time.time() * 1000),
         "type": "warning"
     }
+    send_log_sync(workflow_id, log)
 
     return {
         **state,
@@ -491,6 +548,16 @@ Demande : {request}
     graph = build_graph(llm_with_tools, llm_with_tools_no_check)
     final_state = graph.invoke(initial_state)
 
+    # Envoyer le statut final via WebSocket
+    try:
+        from app.api.websocket import manager
+        await manager.send_status(workflow_id, final_state["status"], {
+            "checkpoint_data": final_state.get("checkpoint_data", {}),
+            "clarification_question": final_state.get("clarification_question", "")
+        })
+    except Exception:
+        pass
+
     return {
         "workflow_id": workflow_id,
         "status": final_state["status"],
@@ -525,6 +592,15 @@ async def resume_workflow(workflow_id: str, answer: str, stored_state: dict) -> 
 
     graph = build_graph(llm_with_tools, llm_with_tools_no_check)
     final_state = graph.invoke(resumed_state)
+
+    try:
+        from app.api.websocket import manager
+        await manager.send_status(workflow_id, final_state["status"], {
+            "checkpoint_data": final_state.get("checkpoint_data", {}),
+            "clarification_question": final_state.get("clarification_question", "")
+        })
+    except Exception:
+        pass
 
     return {
         "workflow_id": workflow_id,

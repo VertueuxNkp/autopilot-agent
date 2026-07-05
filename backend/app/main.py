@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from app.api.mocks import router as mock_router
 from app.api.routes import router as routes_router
+from app.api.websocket import router as ws_router
 
 load_dotenv()
 
@@ -20,11 +21,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routes mockées (préfixe /mock) — pour que M4 puisse toujours tester
+# Routes mockées
 app.include_router(mock_router, prefix="/mock")
 
-# Routes réelles (préfixe /api) — la vraie logique
+# Routes réelles
 app.include_router(routes_router, prefix="/api")
+
+# WebSocket
+app.include_router(ws_router)
 
 
 @app.get("/")
