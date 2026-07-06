@@ -200,13 +200,27 @@ def tools_node(state: AgentState) -> AgentState:
                 if tool_name == "check_for_ambiguity":
                     ambiguity_checked = True
                     result_dict = result if isinstance(result, dict) else {}
+                    print(f"[DEBUG] result type: {type(result)}")
+                    print(f"[DEBUG] result value: {result}")
+                    print(f"[DEBUG] result_dict: {result_dict}")
                     is_ambiguous = result_dict.get("is_ambiguous", True)
+                    print(f"[DEBUG] is_ambiguous: {is_ambiguous}")
 
                     if not is_ambiguous:
+                        # Récupérer la vraie demande depuis le prompt système
                         original_request = ""
                         for msg in state["messages"]:
                             if hasattr(msg, "content") and isinstance(msg.content, str):
-                                original_request = msg.content
+                                content = msg.content
+                                # Extraire la ligne "Demande : ..."
+                                if "Demande :" in content:
+                                    lines = content.split("\n")
+                                    for line in lines:
+                                        if line.strip().startswith("Demande :"):
+                                            original_request = line.replace("Demande :", "").strip()
+                                            break
+                                if not original_request:
+                                    original_request = content
                                 break
 
                         action = detect_action(original_request)
@@ -302,7 +316,37 @@ def tools_node(state: AgentState) -> AgentState:
                                     }
                                     new_logs.append(fallback_log)
                                     send_log_sync(workflow_id, fallback_log)
+                    else:
+                        # is_ambiguous=True → déclencher clarification directement
+                        ambiguities = result_dict.get("ambiguities", [])
+                        question = ambiguities[0] if ambiguities else "Pouvez-vous préciser votre demande ?"
 
+                        clarify_log = {
+                            "step": step,
+                            "message": f"Question posée à l'utilisateur : {question}",
+                            "timestamp": int(time.time() * 1000),
+                            "type": "warning"
+                        }
+                        new_logs.append(clarify_log)
+                        send_log_sync(workflow_id, clarify_log)
+
+                        new_messages.append(
+                            ToolMessage(
+                                content=str(result),
+                                tool_call_id=tool_call["id"]
+                            )
+                        )
+
+                        return {
+                            **state,
+                            "messages": state["messages"] + new_messages,
+                            "reasoning_logs": state["reasoning_logs"] + new_logs,
+                            "step_count": step,
+                            "ambiguity_checked": ambiguity_checked,
+                            "status": "clarification_required",
+                            "clarification_question": question,
+                            "fallback_context": {}
+                        }
                 new_messages.append(
                     ToolMessage(
                         content=str(result),
@@ -378,7 +422,6 @@ def tools_node(state: AgentState) -> AgentState:
 
     return new_state
 
-
 def should_continue(state: AgentState) -> str:
     if state.get("status") == "clarification_required":
         return "end"
@@ -387,6 +430,17 @@ def should_continue(state: AgentState) -> str:
         return "end"
 
     last_message = state["messages"][-1]
+
+    # Si le dernier message est un ToolMessage de check_for_ambiguity
+    # et que ambiguity_checked vient d'être mis à True
+    # → on doit continuer vers l'action
+    if state.get("ambiguity_checked") and hasattr(last_message, "content"):
+        # Vérifier si c'est un ToolMessage (pas un AIMessage avec tool_calls)
+        from langchain_core.messages import ToolMessage
+        if isinstance(last_message, ToolMessage):
+            # L'action a déjà été exécutée directement dans tools_node
+            # Si on arrive ici c'est que tools_node n'a pas retourné early
+            return "end"
 
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         tool_names = [tc["name"] for tc in last_message.tool_calls]

@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Autopilot Agent — Track 4 Qwen Hackathon</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <!-- HEADER -->
+    <header>
+        <div class="header-content">
+            <div class="logo">
+                <span class="logo-icon">🤖</span>
+                <span class="logo-text">Autopilot Agent</span>
+            </div>
+            <div class="status-badge" id="connectionStatus">
+                <span class="status-dot"></span>
+                <span>Déconnecté</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- MAIN -->
+    <main>
+
+        <!-- COLONNE GAUCHE : Formulaire + Clarification + Checkpoint -->
+        <section class="left-panel">
+
+            <!-- FORMULAIRE DE DEMANDE -->
+            <div class="card" id="requestCard">
+                <h2>📝 Nouvelle demande</h2>
+                <div class="form-group">
+                    <label for="userId">Identifiant utilisateur</label>
+                    <input type="text" id="userId" value="user-001" placeholder="ex: user-001">
+                </div>
+                <div class="form-group">
+                    <label for="requestInput">Votre demande</label>
+                    <textarea id="requestInput" rows="4"
+                        placeholder="Ex: Envoie un email à jean@example.com pour confirmer la réunion de demain à 10h"></textarea>
+                </div>
+                <div class="examples">
+                    <p>Exemples :</p>
+                    <button class="example-btn" onclick="setExample('Envoie un email à jean@example.com pour confirmer la réunion de demain')">
+                        📧 Email
+                    </button>
+                    <button class="example-btn" onclick="setExample('Génère un devis pour Marie pour 3 produits à 150 euros chacun avec 10% de réduction')">
+                        📄 Devis
+                    </button>
+                    <button class="example-btn" onclick="setExample('Planifie une réunion avec Paul le 10 juillet à 14h pour 60 minutes')">
+                        📅 Réunion
+                    </button>
+                </div>
+                <button class="btn-primary" id="submitBtn" onclick="submitWorkflow()">
+                    🚀 Lancer le workflow
+                </button>
+            </div>
+
+            <!-- ZONE DE CLARIFICATION -->
+            <div class="card hidden" id="clarificationCard">
+                <h2>❓ Clarification requise</h2>
+                <p class="clarification-question" id="clarificationQuestion"></p>
+                <div class="form-group">
+                    <label for="clarificationAnswer">Votre réponse</label>
+                    <input type="text" id="clarificationAnswer" placeholder="Tapez votre réponse...">
+                </div>
+                <button class="btn-primary" onclick="sendReply()">
+                    ✅ Répondre
+                </button>
+            </div>
+
+            <!-- ZONE DE CHECKPOINT -->
+            <div class="card hidden" id="checkpointCard">
+                <h2>⚠️ Confirmation requise</h2>
+                <p class="checkpoint-message">L'agent souhaite exécuter l'action suivante :</p>
+                <div class="checkpoint-details" id="checkpointDetails"></div>
+                <div class="checkpoint-actions">
+                    <button class="btn-success" onclick="confirmAction(true)">
+                        ✅ Confirmer
+                    </button>
+                    <button class="btn-danger" onclick="confirmAction(false)">
+                        ❌ Annuler
+                    </button>
+                </div>
+            </div>
+
+            <!-- RÉSULTAT FINAL -->
+            <div class="card hidden" id="resultCard">
+                <h2 id="resultTitle">✅ Workflow terminé</h2>
+                <p id="resultMessage"></p>
+                <button class="btn-secondary" onclick="resetWorkflow()">
+                    🔄 Nouveau workflow
+                </button>
+            </div>
+
+        </section>
+
+        <!-- COLONNE DROITE : Reasoning Trace -->
+        <section class="right-panel">
+            <div class="card reasoning-card">
+                <div class="reasoning-header">
+                    <h2>🧠 Reasoning Trace</h2>
+                    <span class="workflow-id-display" id="workflowIdDisplay"></span>
+                </div>
+                <div class="reasoning-status" id="reasoningStatus">
+                    En attente d'une demande...
+                </div>
+                <div class="reasoning-logs" id="reasoningLogs">
+                    <div class="empty-state">
+                        <span>🤖</span>
+                        <p>Les étapes de raisonnement de l'agent apparaîtront ici en temps réel</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <script src="script.js"></script>
+</body>
+</html>
